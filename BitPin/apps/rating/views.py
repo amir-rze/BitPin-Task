@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -17,103 +18,102 @@ ARTICLE_CACHE_TTL = 10 * 60  # 10 minutes
 CACHE_TTL = 60 * 15  # 15 minutes cache TTL
 OUTLIER_THRESHOLD = 2
 NUM_RATING_THRESHOLD = 50
-MIN_TIME_WINDOW_SECOND = 10
-MID_TIME_WINDOW_SECOND = 60
-WEIGHT = 1.0
+
+MIN_TIME_WINDOW_SECOND = 5
+
 # Initialize Redis
 r = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, db=0)
 
 
 class RatingView(APIView):
 
-    def calculate_simple_avg(self, article, new_score):
+    def calculate_dynamic_alpha(self, old_ema, score, last_score, last_rating_time, _time,
+                                K=86400):  # Default K = 86400 seconds (1 day)
 
-        article.num_ratings += 1
-        article.avg_rating = (article.avg_rating * (article.num_ratings - 1) + new_score) / article.num_ratings
-        article.last_rating_time = timezone.now()
-        article.save()
-        return article.avg_rating
+        if isinstance(last_rating_time, str):
+            last_rating_time = datetime.fromisoformat(last_rating_time.replace('Z', '+00:00'))
 
-    def calculate_ema(self, article, new_score):
+        if isinstance(_time, str):
+            _time = datetime.fromisoformat(_time.replace('Z', '+00:00'))
 
-        diff = timezone.now() - article.last_rating_time
-        diff_seconds = diff.total_seconds()
+        if last_rating_time:
+            time_diff = _time - last_rating_time
+            time_diff_seconds = time_diff.total_seconds()
 
-        if diff_seconds <= MIN_TIME_WINDOW_SECOND:
-            alpha = 0.02  # Lower alpha for recent ratings
-        elif (diff_seconds < MID_TIME_WINDOW_SECOND) and (diff_seconds > MIN_TIME_WINDOW_SECOND):
-            alpha = 0.1  # Higher alpha for older ratings
+            alpha = time_diff_seconds / (K + time_diff_seconds)
+
+            if time_diff_seconds < MIN_TIME_WINDOW_SECOND and score == last_score and abs(
+                    old_ema - score) > OUTLIER_THRESHOLD:
+                alpha /= abs(old_ema - score)
         else:
-            alpha = 0.3
+            alpha = 1
 
-        # Calculate new EMA
-        article.avg_rating = alpha * new_score + (1 - alpha) * article.avg_rating
-        article.num_ratings += 1
-        article.last_rating_time = timezone.now()
-        article.save()
-        return article.avg_rating
+        return alpha
 
-    def get_article_from_cache_or_db(self, article_id):
+    def get_article_from_cache(self, article_id):
 
         cache_key = f"article_{article_id}"
         cached_article = r.hgetall(cache_key)
 
         if cached_article:
             article_data = {k.decode(): v.decode() for k, v in cached_article.items()}
-            return Article(**article_data)
+            article_data['num_ratings'] = int(article_data['num_ratings'])
+            article_data['avg_rating'] = float(article_data['avg_rating'])
+            article_data['last_score'] = int(article_data['last_score'])
+            article_data['last_rating_time'] = None if article_data['last_rating_time'] == "None" else article_data[
+                'last_rating_time']
+            return article_data
 
         try:
             article = Article.objects.get(id=article_id)
         except Article.DoesNotExist:
             return None
 
-        r.hmset(cache_key, {
-            "id": article.id,
-            "title": article.title,
-            "content": article.content,
-            "num_ratings": article.num_ratings,
-            "avg_rating": article.avg_rating,
-            "last_rating_time": article.last_rating_time.isoformat()
-        })
-        return article
+        article_data = {
+            "id": article_id,
+            "num_ratings": 0,
+            "avg_rating": 0.0,
+            'last_score': -1,
+            "last_rating_time": "None"
+        }
+
+        r.hset(name=cache_key, mapping=article_data)
+        return article_data
 
     def post(self, request, article_id):
 
         user_id = request.data.get('user_id')
         score = request.data.get('score')
 
-        if not (1 <= score <= 5):
-            return Response({'error': 'Score must be between 1 and 5'}, status=status.HTTP_400_BAD_REQUEST)
+        if not (0 <= score <= 5):
+            return Response({'error': 'Score must be between 0 and 5'}, status=status.HTTP_400_BAD_REQUEST)
 
         with transaction.atomic():
-            # Update or create rating
             rating, created = Rating.objects.update_or_create(
                 article_id=article_id, user_id=user_id,
                 defaults={'score': score}
             )
 
-        article = self.get_article_from_cache_or_db(article_id)
-        if not article:
+        article_data = self.get_article_from_cache(article_id)
+        if not article_data:
             return Response({'error': 'Article not found'}, status=status.HTTP_404_NOT_FOUND)
-
-        if article.num_ratings < NUM_RATING_THRESHOLD:
-            new_avg = self.calculate_simple_avg(article, score)
-        else:
-            new_avg = self.calculate_ema(article, score)
+        print(article_data)
+        _time = timezone.now()
+        alpha = self.calculate_dynamic_alpha(article_data['avg_rating'], score, article_data['last_score'],
+                                             article_data['last_rating_time'], _time)
+        new_ema = article_data['avg_rating'] * (1 - alpha) + score * alpha
 
         cache_key = f"article_{article_id}"
-        r.hmset(cache_key, {
-            "id": article.id,
-            "title": article.title,
-            "content": article.content,
-            "num_ratings": article.num_ratings,
-            "avg_rating": article.avg_rating,
-            "last_rating_time": article.last_rating_time.isoformat()
+        r.hset(name=cache_key, mapping={
+            "id": article_id,
+            "last_score": score,
+            "num_ratings": article_data['num_ratings'] + 1 if created else article_data['num_ratings'],
+            "avg_rating": new_ema,
+            "last_rating_time": _time.isoformat()
         })
 
         return Response({
-            'message': 'Rating submitted successfully',
-            'new_avg_rating': new_avg
+            'detail': 'Rating submitted successfully',
         }, status=status.HTTP_200_OK)
 
 

@@ -5,9 +5,7 @@ class Article(models.Model):
     title = models.CharField(max_length=100)
     content = models.TextField()
     num_ratings = models.IntegerField(default=0)
-    average_rating = models.FloatField(default=0.0)
-    alpha = models.FloatField(default= 1.0)
-    last_rating_time = models.DateTimeField(null=True, blank=True)
+    avg_rating = models.FloatField(default=0.0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -15,7 +13,7 @@ class Article(models.Model):
 class Rating(models.Model):
     article = models.ForeignKey(Article,related_name='ratings', on_delete=models.CASCADE)
     user_id = models.IntegerField()
-    score = models.IntegerField(validators=[MinValueValidator(1), MaxValueValidator(5)])
+    score = models.IntegerField(validators=[MinValueValidator(0), MaxValueValidator(5)])
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
